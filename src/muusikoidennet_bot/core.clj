@@ -5,10 +5,174 @@
             [net.cgrand.enlive-html :as html])
   (:gen-class))
 
-(def search-url "https://muusikoiden.net/tori/haku.php")
-(def browse-url "https://muusikoiden.net/tori/")
 (def searches-file "data/searches.json")
 (def data-file "data/seen-items.json")
+(def config-file "data/config.json")
+
+;; =============================================================================
+;; Config & Telegram
+;; =============================================================================
+
+(defn load-config []
+  (let [file-config (if (.exists (io/file config-file))
+                      (-> (slurp config-file)
+                          (json/read-str :key-fn keyword))
+                      {})
+        ;; Override with environment variables if set
+        env-api-key (System/getenv "TELEGRAM_API_KEY")
+        env-chat-id (System/getenv "TELEGRAM_CHAT_ID")
+        env-enabled (System/getenv "TELEGRAM_ENABLED")]
+    (cond-> file-config
+      env-api-key (assoc-in [:telegram :api_key] env-api-key)
+      env-chat-id (assoc-in [:telegram :chat_id] env-chat-id)
+      env-enabled (assoc-in [:telegram :enabled] (= env-enabled "true")))))
+
+(defn telegram-send-message [config text]
+  (let [api-key (get-in config [:telegram :api_key])
+        chat-id (get-in config [:telegram :chat_id])
+        url (str "https://api.telegram.org/bot" api-key "/sendMessage")]
+    (try
+      (http/post url
+                 {:form-params {:chat_id chat-id
+                                :text text
+                                :parse_mode "HTML"
+                                :disable_web_page_preview "false"}})
+      (catch Exception e
+        (println (str "Telegram error: " (.getMessage e)))))))
+
+(defn telegram-enabled? [config]
+  (and (get-in config [:telegram :enabled])
+       (not= (get-in config [:telegram :api_key]) "YOUR_BOT_API_KEY_HERE")))
+
+(defn format-listing-telegram [{:keys [title url]}]
+  (str "<b>" title "</b>\n" url))
+
+(defn notify-new-listings [config listings]
+  (when (and (telegram-enabled? config) (seq listings))
+    (let [header (str "🎸 " (count listings) " new listing(s) found!\n\n")
+          body (clojure.string/join "\n\n" (map format-listing-telegram listings))
+          message (str header body)]
+      (telegram-send-message config message))))
+
+;; =============================================================================
+;; Telegram Commands
+;; =============================================================================
+
+(defn telegram-get-updates [config last-update-id]
+  (let [api-key (get-in config [:telegram :api_key])
+        url (str "https://api.telegram.org/bot" api-key "/getUpdates")]
+    (try
+      (let [response (http/get url
+                               {:query-params (cond-> {:timeout 0}
+                                                last-update-id (assoc :offset (inc last-update-id)))})
+            body (json/read-str (:body response))]
+        (get body "result"))
+      (catch Exception e
+        (println (str "Telegram getUpdates error: " (.getMessage e)))
+        []))))
+
+(defn save-config [config]
+  (spit config-file (json/write-str config :indent true)))
+
+(defn save-searches [searches]
+  (spit searches-file (json/write-str {:searches searches} :indent true)))
+
+(defn load-searches-raw []
+  (if (.exists (io/file searches-file))
+    (-> (slurp searches-file)
+        (json/read-str :key-fn keyword)
+        :searches)
+    []))
+
+(defn valid-search-url? [url]
+  (and (string? url)
+       (clojure.string/starts-with? url "https://muusikoiden.net/tori")))
+
+(defn handle-add-command [config text]
+  (let [url (clojure.string/trim (subs text 4))]
+    (cond
+      (clojure.string/blank? url)
+      (telegram-send-message config
+                             "Usage: /add <url>\n\nExample:\n/add https://muusikoiden.net/tori/haku.php?keyword=strandberg")
+
+      (not (valid-search-url? url))
+      (telegram-send-message config "Invalid URL. Must start with https://muusikoiden.net/tori")
+
+      :else
+      (let [searches (load-searches-raw)]
+        (if (some #{url} searches)
+          (telegram-send-message config "This search already exists.")
+          (do
+            (save-searches (conj (vec searches) url))
+            (telegram-send-message config (str "✅ Search added:\n" url))))))))
+
+(defn handle-list-command [config]
+  (let [searches (load-searches-raw)]
+    (if (seq searches)
+      (let [lines (map-indexed
+                   (fn [i url] (str (inc i) ". " url))
+                   searches)]
+        (telegram-send-message config
+                               (str "📋 Searches:\n\n"
+                                    (clojure.string/join "\n\n" lines))))
+      (telegram-send-message config "No searches configured."))))
+
+(defn handle-remove-command [config text]
+  (let [arg (clojure.string/trim (subs text 7))
+        searches (vec (load-searches-raw))
+        idx (try (dec (Integer/parseInt arg)) (catch Exception _ nil))]
+    (cond
+      (clojure.string/blank? arg)
+      (telegram-send-message config "Usage: /remove <number>")
+
+      (nil? idx)
+      (telegram-send-message config "Please use a number. Use /list to see searches.")
+
+      (or (neg? idx) (>= idx (count searches)))
+      (telegram-send-message config (str "Invalid number (1-" (count searches) ")"))
+
+      :else
+      (let [removed (nth searches idx)
+            updated (vec (concat (take idx searches) (drop (inc idx) searches)))]
+        (save-searches updated)
+        (telegram-send-message config (str "🗑 Removed:\n" removed))))))
+
+(defn handle-help-command [config]
+  (telegram-send-message config
+                         (str "🎸 <b>Muusikoiden.net Bot</b>\n\n"
+                              "Commands:\n"
+                              "/add &lt;url&gt; - Add search URL\n"
+                              "/list - List all searches\n"
+                              "/remove &lt;n&gt; - Remove search by number\n"
+                              "/help - Show this help\n\n"
+                              "Example:\n"
+                              "<code>/add https://muusikoiden.net/tori/haku.php?keyword=strandberg</code>")))
+
+(defn process-telegram-command [config message]
+  (let [text (get message "text" "")
+        chat-id (str (get-in message ["chat" "id"]))]
+    ;; Only process from configured chat
+    (when (= chat-id (get-in config [:telegram :chat_id]))
+      (cond
+        (clojure.string/starts-with? text "/add") (handle-add-command config text)
+        (clojure.string/starts-with? text "/list") (handle-list-command config)
+        (clojure.string/starts-with? text "/remove") (handle-remove-command config text)
+        (clojure.string/starts-with? text "/help") (handle-help-command config)
+        (clojure.string/starts-with? text "/start") (handle-help-command config)))))
+
+(defn process-telegram-updates [config]
+  (when (telegram-enabled? config)
+    (let [last-update-id (get-in config [:telegram :last_update_id])
+          updates (telegram-get-updates config last-update-id)]
+      (when (seq updates)
+        (println (str "Processing " (count updates) " Telegram update(s)..."))
+        (doseq [update updates]
+          (when-let [message (get update "message")]
+            (process-telegram-command config message)))
+        ;; Save last update ID
+        (let [max-update-id (apply max (map #(get % "update_id") updates))
+              updated-config (assoc-in config [:telegram :last_update_id] max-update-id)]
+          (save-config updated-config))))))
 
 ;; =============================================================================
 ;; Search Parameter Reference
@@ -251,15 +415,8 @@
     (-> (slurp searches-file)
         (json/read-str :key-fn keyword)
         :searches
-        (->> (filter :enabled)))
+        vec)
     []))
-
-(defn build-search-url [{:keys [params]}]
-  (let [base (if (:keyword params) search-url browse-url)
-        query-string (->> params
-                          (map (fn [[k v]] (str (name k) "=" (java.net.URLEncoder/encode (str v) "UTF-8"))))
-                          (clojure.string/join "&"))]
-    (str base "?" query-string)))
 
 (defn ensure-data-dir []
   (let [dir (io/file "data")]
@@ -335,11 +492,9 @@
   (println (str "   URL: " url))
   (println (str "   ID: " id)))
 
-(defn fetch-search-listings [search]
-  (let [url (build-search-url search)
-        _ (println (str "\n--- " (:name search) " ---"))
-        _ (println (str "URL: " url))
-        page (fetch-page url)
+(defn fetch-search-listings [url]
+  (println (str "\n--- " url " ---"))
+  (let [page (fetch-page url)
         listings (extract-listings page)]
     (println (str "Found " (count listings) " listings"))
     listings))
@@ -351,10 +506,15 @@
        (map first)))
 
 (defn -main [& args]
-  (println "Fetching muusikoiden.net listings...")
+  (println "Muusikoiden.net Bot starting...")
 
   (try
-    (let [searches (load-searches)
+    (let [config (load-config)
+          _ (println (str "Telegram: " (if (telegram-enabled? config) "enabled" "disabled")))
+          ;; Process any pending Telegram commands first
+          _ (process-telegram-updates config)
+          ;; Reload searches in case they were modified by commands
+          searches (load-searches)
           _ (println (str "Loaded " (count searches) " search(es)"))
           seen-ids (load-seen-items)
           _ (println (str "Previously seen items: " (count seen-ids)))
@@ -374,7 +534,9 @@
         (do
           (println (str "\n✨ " (count new-listings) " NEW LISTING(S):"))
           (doseq [listing new-listings]
-            (print-new-listing listing)))
+            (print-new-listing listing))
+          ;; Send Telegram notification
+          (notify-new-listings config new-listings))
         (println "\nNo new listings found."))
 
       (save-seen-items updated-seen-ids)
