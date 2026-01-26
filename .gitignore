@@ -1,0 +1,4 @@
+data/
+.cpcache/
+.nrepl-port
+*.log
